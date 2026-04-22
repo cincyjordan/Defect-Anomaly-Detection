@@ -15,6 +15,7 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image
 from sklearn.model_selection import train_test_split
+from torchvision import transforms
 
 DOWNLOADED_FOLDER = "visa-anomaly-detection"
 OUTPUT_DIR = Path("data/raw")
@@ -22,10 +23,53 @@ SPLIT_OUT = Path("data/processed/split_assignments.csv")
 BY_SPLIT_ROOT = Path("data/processed/by_split")
 RANDOM_STATE = 42
 
+# Shared preprocessing settings for BOTH VAE and classifier inputs.
+IMAGE_SIZE = (256, 256)
+NORMALIZE_MEAN = (0.485, 0.456, 0.406)
+NORMALIZE_STD = (0.229, 0.224, 0.225)
+
+
+def get_eval_transform() -> transforms.Compose:
+    """Deterministic preprocessing for val/test/inference."""
+    # Keep evaluation deterministic so metrics are comparable run-to-run.
+    return transforms.Compose(
+        [
+            transforms.Resize(IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD),
+        ]
+    )
+
+
+def get_train_transform(use_augmentation: bool = False) -> transforms.Compose:
+    """
+    Train preprocessing with the same size/normalization config.
+    Optional augmentation is deliberately mild.
+    """
+    # Always enforce one size first so model input shape is fixed.
+    steps: list[transforms.Transform] = [transforms.Resize(IMAGE_SIZE)]
+    if use_augmentation:
+        # Optional, mild augmentation only.
+        steps.extend(
+            [
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=5),
+            ]
+        )
+    steps.extend(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD),
+        ]
+    )
+    return transforms.Compose(steps)
 
 if __name__ == "__main__":
     out = OUTPUT_DIR.resolve()
     data_root: Path | None = None
+    # Support either layout:
+    # 1) data/raw/<category>/...
+    # 2) data/raw/visa-anomaly-detection/<category>/...
     for candidate in (out, out / DOWNLOADED_FOLDER):
         if not candidate.is_dir():
             continue
@@ -44,6 +88,7 @@ if __name__ == "__main__":
         )
         raise SystemExit(1)
 
+    # Build one unified manifest from each category's image_anno.csv.
     parts: list[pd.DataFrame] = []
     for d in sorted(data_root.iterdir()):
         if not d.is_dir():
@@ -67,9 +112,11 @@ if __name__ == "__main__":
 
     print(f"Data root: {data_root}\n")
 
+    # Integrity pass: identify missing/unreadable rows before any counting/splitting.
     print("Integrity (.jpg paths in manifests)")
     bad: list[tuple[str, str]] = []
-    for rel in df["image"].astype(str):
+    for row in df.itertuples(index=False):
+        rel = str(row.image)
         rel_clean = rel.replace("\\", "/").lstrip("/")
         path = (data_root / rel_clean).resolve()
         if not path.is_file():
@@ -89,6 +136,7 @@ if __name__ == "__main__":
         print(f"  {rel} -> {err}")
 
     bad_rels = {rel for rel, _ in bad}
+    # Remove bad files from disk when present.
     for rel in bad_rels:
         rel_clean = rel.replace("\\", "/").lstrip("/")
         fp = (data_root / rel_clean).resolve()
@@ -96,6 +144,7 @@ if __name__ == "__main__":
             fp.unlink()
             print(f"Removed file: {fp}")
 
+    # Keep manifests in sync by dropping rows for removed/bad paths.
     for d in sorted(data_root.iterdir()):
         if not d.is_dir():
             continue
@@ -111,19 +160,20 @@ if __name__ == "__main__":
 
     if bad_rels:
         df = df[~df["image"].isin(bad_rels)].reset_index(drop=True)
-
+    # All downstream stats are computed after cleanup.
     print("\nCounts (after cleanup; image_anno per category)")
     print("Global:")
-    for k, v in df.groupby("binary_label", dropna=False).size().items():
-        print(f"  {k}: {int(v)}")
+    global_counts = df.groupby("binary_label", dropna=False).size()
+    for k, v in global_counts.items():
+        share = (v / len(df)) * 100 if len(df) else 0.0
+        print(f"  {k}: {int(v)} ({share:.2f}%)")
     print("\nBy category x class:")
-    print(
-        df.groupby(["object", "binary_label"])
-        .size()
-        .unstack(fill_value=0)
-        .to_string()
-    )
+    by_object_class = df.groupby(["object", "binary_label"]).size().unstack(fill_value=0)
+    print(by_object_class.to_string())
+    print("\nBy category x class (% within category):")
+    print((by_object_class.div(by_object_class.sum(axis=1), axis=0) * 100).round(2).to_string())
 
+    # Two-stage split gives exact 60/20/20 while preserving class proportions.
     print("\nTrain / val / test (60% / 20% / 20%, stratified by normal vs anomaly)")
     n = len(df)
     if n == 0:
@@ -160,15 +210,32 @@ if __name__ == "__main__":
     SPLIT_OUT.parent.mkdir(parents=True, exist_ok=True)
     split_df.to_csv(SPLIT_OUT, index=False)
     print(f"Wrote {SPLIT_OUT} ({len(split_df)} rows)")
-    print(
-        split_df.groupby(["split", "binary_label"]).size().unstack(fill_value=0).to_string()
-    )
+    split_class_counts = split_df.groupby(["split", "binary_label"]).size().unstack(fill_value=0)
+    print(split_class_counts.to_string())
+    print("\nSplit x class (% within split):")
+    print((split_class_counts.div(split_class_counts.sum(axis=1), axis=0) * 100).round(2).to_string())
     print(
         "\nFractions of total:",
         f"train {len(train_df) / n:.3f}, val {len(val_df) / n:.3f}, test {len(test_df) / n:.3f}",
     )
+    print("\nSplit quality checks")
+    print("By split x object x class:")
+    split_obj = (
+        split_df.groupby(["split", "object", "binary_label"]).size().unstack(fill_value=0)
+    )
+    print(split_obj.to_string())
+    min_anomaly_per_split_obj = (
+        split_df[split_df["binary_label"] == "anomaly"].groupby(["split", "object"]).size()
+    )
+    low_support = min_anomaly_per_split_obj[min_anomaly_per_split_obj < 5]
+    if len(low_support) > 0:
+        print("\nWARNING: low anomaly support (<5) in split/object cells:")
+        for (sp, obj), cnt in low_support.items():
+            print(f"  {sp} / {obj}: {int(cnt)}")
+    else:
+        print("\nNo split/object anomaly cells below 5 samples.")
 
-    # Folder layout: same relative paths as under data/raw, grouped under train/val/test (full copies).
+    # Mirror split folders for tooling that expects directory-based datasets.
     if BY_SPLIT_ROOT.exists():
         shutil.rmtree(BY_SPLIT_ROOT)
     BY_SPLIT_ROOT.mkdir(parents=True, exist_ok=True)
