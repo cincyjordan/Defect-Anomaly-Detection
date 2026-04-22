@@ -19,8 +19,12 @@ from torchvision import transforms
 
 DOWNLOADED_FOLDER = "visa-anomaly-detection"
 OUTPUT_DIR = Path("data/raw")
-SPLIT_OUT = Path("data/processed/split_assignments.csv")
-BY_SPLIT_ROOT = Path("data/processed/by_split")
+CLASSIFIER_ROOT = Path("data/processed/classifier")
+CLASSIFIER_SPLIT_OUT = CLASSIFIER_ROOT / "split_assignments.csv"
+CLASSIFIER_BY_SPLIT_ROOT = CLASSIFIER_ROOT / "by_split"
+VAE_ROOT = Path("data/processed/vae")
+VAE_SPLIT_OUT = VAE_ROOT / "split_assignments.csv"
+VAE_BY_SPLIT_ROOT = VAE_ROOT / "by_split"
 RANDOM_STATE = 42
 
 # Shared preprocessing settings for BOTH VAE and classifier inputs.
@@ -65,6 +69,7 @@ def get_train_transform(use_augmentation: bool = False) -> transforms.Compose:
     return transforms.Compose(steps)
 
 if __name__ == "__main__":
+    force_rebuild = "--force-rebuild" in sys.argv
     out = OUTPUT_DIR.resolve()
     data_root: Path | None = None
     # Support either layout:
@@ -173,6 +178,57 @@ if __name__ == "__main__":
     print("\nBy category x class (% within category):")
     print((by_object_class.div(by_object_class.sum(axis=1), axis=0) * 100).round(2).to_string())
 
+    # If processed splits already exist, run quality checks only.
+    # Avoids rebuilding the splits and copying the images when not necessary.
+    classifier_exists = CLASSIFIER_SPLIT_OUT.is_file()
+    vae_exists = VAE_SPLIT_OUT.is_file()
+    if classifier_exists and vae_exists and not force_rebuild:
+        print(
+            "\nProcessed split CSVs already exist. "
+            "Skipping rebuild/copy and running quality checks only. "
+            "Use --force-rebuild to regenerate."
+        )
+
+        # Classifier split checks from existing CSV.
+        split_df = pd.read_csv(CLASSIFIER_SPLIT_OUT)
+        print(f"\nLoaded {CLASSIFIER_SPLIT_OUT} ({len(split_df)} rows)")
+        split_class_counts = split_df.groupby(["split", "binary_label"]).size().unstack(fill_value=0)
+        print(split_class_counts.to_string())
+        print("\nSplit x class (% within split):")
+        print((split_class_counts.div(split_class_counts.sum(axis=1), axis=0) * 100).round(2).to_string())
+        print("\nSplit quality checks")
+        print("By split x object x class:")
+        split_obj = (
+            split_df.groupby(["split", "object", "binary_label"]).size().unstack(fill_value=0)
+        )
+        print(split_obj.to_string())
+        min_anomaly_per_split_obj = (
+            split_df[split_df["binary_label"] == "anomaly"].groupby(["split", "object"]).size()
+        )
+        low_support = min_anomaly_per_split_obj[min_anomaly_per_split_obj < 5]
+        if len(low_support) > 0:
+            print("\nWARNING: low anomaly support (<5) in split/object cells:")
+            for (sp, obj), cnt in low_support.items():
+                print(f"  {sp} / {obj}: {int(cnt)}")
+        else:
+            print("\nNo split/object anomaly cells below 5 samples.")
+
+        # VAE split checks from existing CSV.
+        vae_split_df = pd.read_csv(VAE_SPLIT_OUT)
+        print(f"\nLoaded {VAE_SPLIT_OUT} ({len(vae_split_df)} rows)")
+        print(vae_split_df.groupby("split").size().to_string())
+        print("\nVAE split quality checks")
+        vae_split_obj = vae_split_df.groupby(["split", "object"]).size()
+        print(vae_split_obj.to_string())
+        low_support_vae = vae_split_obj[vae_split_obj < 5]
+        if len(low_support_vae) > 0:
+            print("\nWARNING: low anomaly support (<5) in VAE split/object cells:")
+            for (sp, obj), cnt in low_support_vae.items():
+                print(f"  {sp} / {obj}: {int(cnt)}")
+        else:
+            print("\nNo VAE split/object anomaly cells below 5 samples.")
+        raise SystemExit(0)
+
     # Two-stage split gives exact 60/20/20 while preserving class proportions.
     print("\nTrain / val / test (60% / 20% / 20%, stratified by normal vs anomaly)")
     n = len(df)
@@ -207,9 +263,9 @@ if __name__ == "__main__":
     test_df["split"] = "test"
 
     split_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
-    SPLIT_OUT.parent.mkdir(parents=True, exist_ok=True)
-    split_df.to_csv(SPLIT_OUT, index=False)
-    print(f"Wrote {SPLIT_OUT} ({len(split_df)} rows)")
+    CLASSIFIER_SPLIT_OUT.parent.mkdir(parents=True, exist_ok=True)
+    split_df.to_csv(CLASSIFIER_SPLIT_OUT, index=False)
+    print(f"Wrote {CLASSIFIER_SPLIT_OUT} ({len(split_df)} rows)")
     split_class_counts = split_df.groupby(["split", "binary_label"]).size().unstack(fill_value=0)
     print(split_class_counts.to_string())
     print("\nSplit x class (% within split):")
@@ -235,18 +291,90 @@ if __name__ == "__main__":
     else:
         print("\nNo split/object anomaly cells below 5 samples.")
 
-    # Mirror split folders for tooling that expects directory-based datasets.
-    if BY_SPLIT_ROOT.exists():
-        shutil.rmtree(BY_SPLIT_ROOT)
-    BY_SPLIT_ROOT.mkdir(parents=True, exist_ok=True)
+    # Mirror classifier split folders for tooling that expects directory-based datasets.
+    if CLASSIFIER_BY_SPLIT_ROOT.exists():
+        shutil.rmtree(CLASSIFIER_BY_SPLIT_ROOT)
+    CLASSIFIER_BY_SPLIT_ROOT.mkdir(parents=True, exist_ok=True)
     n_copied = 0
     for _, row in split_df.iterrows():
         rel = str(row["image"]).replace("\\", "/").lstrip("/")
         src = (data_root / rel).resolve()
         if not src.is_file():
             continue
-        dst = BY_SPLIT_ROOT / str(row["split"]) / rel
+        dst = CLASSIFIER_BY_SPLIT_ROOT / str(row["split"]) / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         n_copied += 1
-    print(f"\nFolder copy: {BY_SPLIT_ROOT}/{{train,val,test}}/… ({n_copied} files)")
+    print(
+        f"\nClassifier folder copy: {CLASSIFIER_BY_SPLIT_ROOT}/{{train,val,test}}/… "
+        f"({n_copied} files)"
+    )
+
+    # VAE split (anomaly-only)
+    vae_df = df[df["binary_label"] == "anomaly"].copy()
+    print("\nVAE split (anomaly-only train/val/test: 60% / 20% / 20%)")
+    n_vae = len(vae_df)
+    if n_vae == 0:
+        print("No anomaly rows available; skipping VAE split.", file=sys.stderr)
+    else:
+        vae_train_df, vae_temp_df = train_test_split(
+            vae_df,
+            test_size=0.4,
+            random_state=RANDOM_STATE,
+            shuffle=True,
+        )
+        vae_val_df, vae_test_df = train_test_split(
+            vae_temp_df,
+            test_size=0.5,
+            random_state=RANDOM_STATE,
+            shuffle=True,
+        )
+
+        vae_train_df = vae_train_df.copy()
+        vae_val_df = vae_val_df.copy()
+        vae_test_df = vae_test_df.copy()
+        vae_train_df["split"] = "train"
+        vae_val_df["split"] = "val"
+        vae_test_df["split"] = "test"
+
+        vae_split_df = pd.concat([vae_train_df, vae_val_df, vae_test_df], ignore_index=True)
+        VAE_SPLIT_OUT.parent.mkdir(parents=True, exist_ok=True)
+        vae_split_df.to_csv(VAE_SPLIT_OUT, index=False)
+        print(f"Wrote {VAE_SPLIT_OUT} ({len(vae_split_df)} rows)")
+        print(vae_split_df.groupby("split").size().to_string())
+        print(
+            "Fractions of total:",
+            f"train {len(vae_train_df) / n_vae:.3f}, "
+            f"val {len(vae_val_df) / n_vae:.3f}, "
+            f"test {len(vae_test_df) / n_vae:.3f}",
+        )
+
+        # Same split-quality style checks for VAE rows.
+        print("\nVAE split quality checks")
+        vae_split_obj = vae_split_df.groupby(["split", "object"]).size()
+        print(vae_split_obj.to_string())
+        low_support_vae = vae_split_obj[vae_split_obj < 5]
+        if len(low_support_vae) > 0:
+            print("\nWARNING: low anomaly support (<5) in VAE split/object cells:")
+            for (sp, obj), cnt in low_support_vae.items():
+                print(f"  {sp} / {obj}: {int(cnt)}")
+        else:
+            print("\nNo VAE split/object anomaly cells below 5 samples.")
+
+        if VAE_BY_SPLIT_ROOT.exists():
+            shutil.rmtree(VAE_BY_SPLIT_ROOT)
+        VAE_BY_SPLIT_ROOT.mkdir(parents=True, exist_ok=True)
+        n_vae_copied = 0
+        for _, row in vae_split_df.iterrows():
+            rel = str(row["image"]).replace("\\", "/").lstrip("/")
+            src = (data_root / rel).resolve()
+            if not src.is_file():
+                continue
+            dst = VAE_BY_SPLIT_ROOT / str(row["split"]) / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            n_vae_copied += 1
+        print(
+            f"\nVAE folder copy: {VAE_BY_SPLIT_ROOT}/{{train,val,test}}/… "
+            f"({n_vae_copied} files)"
+        )
