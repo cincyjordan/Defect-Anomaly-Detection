@@ -3,11 +3,17 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader, Dataset
 
 from anomalydetect import IMAGE_SIZE, get_eval_transform, get_train_transform
@@ -165,6 +171,8 @@ def test_loop(model: nn.Module, test_loader: DataLoader, device: torch.device) -
     test_correct = 0
     test_total = 0
     test_batches = 0
+    y_chunks: list[np.ndarray] = []
+    prob_chunks: list[np.ndarray] = []
     with torch.no_grad():
         for x, y in test_loader:
             x = x.to(device)
@@ -174,14 +182,43 @@ def test_loop(model: nn.Module, test_loader: DataLoader, device: torch.device) -
             loss = criterion(logits, y)
             test_loss_sum += float(loss.item())
 
-            preds = (torch.sigmoid(logits) >= 0.5).float()
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).float()
             test_correct += int((preds == y).sum().item())
             test_total += int(y.numel())
             test_batches += 1
 
+            y_chunks.append(y.detach().float().cpu().numpy())
+            prob_chunks.append(probs.detach().cpu().numpy())
+
+    y_true = np.concatenate(y_chunks).astype(np.int64)
+    y_prob = np.concatenate(prob_chunks).astype(np.float64)
+    y_pred = (y_prob >= 0.5).astype(np.int64)
+
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", pos_label=1, zero_division=0
+    )
+    pr_auc = float(average_precision_score(y_true, y_prob))
+    if len(np.unique(y_true)) < 2:
+        roc_auc = float("nan")
+    else:
+        roc_auc = float(roc_auc_score(y_true, y_prob))
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
+
     return {
         "loss": test_loss_sum / max(test_batches, 1),
         "acc": test_correct / max(test_total, 1),
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(f1),
+        "pr_auc": pr_auc,
+        "roc_auc": roc_auc,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "tp": tp,
     }
 
 
@@ -274,7 +311,20 @@ def run():
         test_stats = test_loop(best_model, test_loader, device)
 
         print(f"best val loss (trial {trial_idx:03d}): {best_val_loss:.6f}")
-        print(f"test loss {test_stats['loss']:.6f}, test acc {test_stats['acc']:.4f}")
+        print(
+            f"test loss {test_stats['loss']:.6f}, acc {test_stats['acc']:.4f} | "
+            f"precision {test_stats['precision']:.4f}, recall {test_stats['recall']:.4f}, "
+            f"f1 {test_stats['f1']:.4f} | PR-AUC {test_stats['pr_auc']:.4f}",
+            end="",
+        )
+        if np.isfinite(test_stats["roc_auc"]):
+            print(f", ROC-AUC {test_stats['roc_auc']:.4f}")
+        else:
+            print(" (ROC-AUC n/a: single class in test)")
+        print(
+            f"confusion (tn fp / fn tp): {test_stats['tn']} {test_stats['fp']} / "
+            f"{test_stats['fn']} {test_stats['tp']}"
+        )
         print(f"checkpoint: {best_path}")
 
         if best_val_loss < best_overall["val_loss"]:
