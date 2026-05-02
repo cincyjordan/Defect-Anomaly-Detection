@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+# Baseline binary classifier: VisA normal vs anomaly.
+
+# Purpose: Establish a benchmark before adding VAE-generated synthetic defects. Same
+# preprocessing as anomalydetect.py ensures fair comparison later when augmenting train.
+
+# Data: data/processed/classifier/split_assignments.csv (train/val/test rows) produced by
+# anomalydetect.py; image paths resolve under data/raw (see choose_data_root).
+
+# Training: Random hyperparameter search (N_TRIALS x EPOCHS per trial). Each trial saves
+# best weights by lowest validation BCE loss under artifacts/classifier/. Test metrics
+# include PR-AUC / ROC-AUC because accuracy alone is misleading under class imbalance.
+
 import random
 from pathlib import Path
 
@@ -16,23 +28,28 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, Dataset
 
+# Shared crop size and transforms with anomalydetect / VAE so all models see comparable pixels.
 from anomalydetect import IMAGE_SIZE, get_eval_transform, get_train_transform
 
 CLASSIFIER_SPLIT_CSV = Path("data/processed/classifier/split_assignments.csv")
 RAW_ROOT = Path("data/raw")
 CHECKPOINT_DIR = Path("artifacts/classifier")
 
+# Controls repeatability of weight init and the random-search sampler.
 SEED = 42
 EPOCHS = 20
+# DataLoader prefetch workers (0 = load in main process only).
 NUM_WORKERS = 2
 N_TRIALS = 10
 
+# Random-search space: log-uniform LR; discrete choices for batch size, dropout, augmentation.
 LR_LOG10_RANGE = (-4.3, -2.7)  # ~5e-5 to ~2e-3
 BATCH_SIZE_CHOICES = [16, 32, 64]
 DROPOUT_CHOICES = [0.1, 0.2, 0.3, 0.4]
 USE_AUG_CHOICES = [False, True]
 
 
+# PyTorch Dataset wrapping one split DataFrame: loads RGB, applies transform, returns label.
 class ClassifierImageDataset(Dataset):
     def __init__(self, frame: pd.DataFrame, data_root: Path, transform) -> None:
         self.frame = frame.reset_index(drop=True)
@@ -44,14 +61,18 @@ class ClassifierImageDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.frame.iloc[idx]
+        # CSV paths are posix-style relative to RAW root; normalize Windows slashes if present.
         rel = str(row["image"]).replace("\\", "/").lstrip("/")
         path = self.data_root / rel
         img = Image.open(path).convert("RGB")
         x = self.transform(img)
+        # BCEWithLogitsLoss expects float targets 0.0 (normal) or 1.0 (anomaly).
         y = 1.0 if str(row["binary_label"]).strip().lower() == "anomaly" else 0.0
         return x, torch.tensor(y, dtype=torch.float32)
 
 
+# Lightweight CNN: stride-2 convs downsample, global average pool to a fixed vector, then
+# linear logits. Dropout is tuned per trial to reduce overfitting given dataset imbalance.
 class BaselineCNN(nn.Module):
     def __init__(self, dropout: float) -> None:
         super().__init__()
@@ -74,9 +95,11 @@ class BaselineCNN(nn.Module):
 
     def forward(self, x):
         x = self.features(x)
+        # Shape (N,) raw logits - sigmoid applied only for metrics / interpretation.
         return self.classifier(x).squeeze(1)
 
 
+# Normalize where VisA JPEGs live: repo may unzip as data/raw/... or data/raw/visa-anomaly-detection/... .
 def choose_data_root() -> Path:
     for p in (RAW_ROOT, RAW_ROOT / "visa-anomaly-detection"):
         if p.is_dir():
@@ -84,7 +107,9 @@ def choose_data_root() -> Path:
     raise FileNotFoundError("Could not locate data root under data/raw")
 
 
-def train_loop(
+# Train + validate each epoch. Checkpoint criterion: lowest validation loss (BCE).
+# Training accuracy is printed for intuition but not used for model selection.
+def train(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     train_loader: DataLoader,
@@ -94,6 +119,7 @@ def train_loop(
     best_path: Path,
 ) -> float:
     best_val_loss = float("inf")
+    # Numerically stable binary classification loss for logits + float {0,1} targets.
     criterion = nn.BCEWithLogitsLoss()
 
     for epoch in range(1, epochs + 1):
@@ -114,6 +140,7 @@ def train_loop(
             optimizer.step()
 
             train_loss_sum += float(loss.item())
+            # Fixed 0.5 probability threshold for binary predictions.
             preds = (torch.sigmoid(logits) >= 0.5).float()
             train_correct += int((preds == y).sum().item())
             train_total += int(y.numel())
@@ -151,6 +178,7 @@ def train_loop(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            # Minimal checkpoint here; run() re-saves with full trial config after training ends.
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -163,7 +191,10 @@ def train_loop(
     return best_val_loss
 
 
-def test_loop(model: nn.Module, test_loader: DataLoader, device: torch.device) -> dict[str, float]:
+# Held-out evaluation: same BCE as training for a comparable "test loss", plus ranking metrics
+# (PR-AUC, ROC-AUC) that reflect rare-positive performance. ROC-AUC is undefined if test has
+# only one class (edge case when filtering or tiny splits).
+def test(model: nn.Module, test_loader: DataLoader, device: torch.device) -> dict[str, float]:
     criterion = nn.BCEWithLogitsLoss()
     model.train(False)
 
@@ -195,6 +226,7 @@ def test_loop(model: nn.Module, test_loader: DataLoader, device: torch.device) -
     y_prob = np.concatenate(prob_chunks).astype(np.float64)
     y_pred = (y_prob >= 0.5).astype(np.int64)
 
+    # Report metrics focused on imbalance performance.
     prec, rec, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", pos_label=1, zero_division=0
     )
@@ -204,6 +236,7 @@ def test_loop(model: nn.Module, test_loader: DataLoader, device: torch.device) -
     else:
         roc_auc = float(roc_auc_score(y_true, y_prob))
 
+    # Fix label order so tn/fp/fn/tp always mean normal-vs-anomaly the same way.
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
 
@@ -223,6 +256,9 @@ def test_loop(model: nn.Module, test_loader: DataLoader, device: torch.device) -
 
 
 def run():
+    # End-to-end: load splits -> for each sampled hyperparam set, train with early-like
+    # selection via best val loss checkpoint -> evaluate best weights on test -> track which
+    # trial minimized validation loss across the whole search.
     if not CLASSIFIER_SPLIT_CSV.is_file():
         raise FileNotFoundError(f"Missing classifier split CSV: {CLASSIFIER_SPLIT_CSV}")
 
@@ -242,10 +278,12 @@ def run():
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     rng = random.Random(SEED)
+    # Tracks the single trial with lowest validation loss (not necessarily best test metrics).
     best_overall = {"val_loss": float("inf"), "trial": None, "path": None, "config": None}
     print(f"Baseline classifier random search: trials={N_TRIALS}, epochs={EPOCHS}, device={device}")
 
     for trial_idx in range(N_TRIALS):
+        # Sample one hyperparameter configuration for this trial.
         cfg = {
             "lr": 10 ** rng.uniform(*LR_LOG10_RANGE),
             "batch_size": rng.choice(BATCH_SIZE_CHOICES),
@@ -258,9 +296,11 @@ def run():
             f"dropout={cfg['dropout']:.2f}, use_aug={cfg['use_aug']}"
         )
 
+        # Train may use jitter/flip/etc.; val/test always deterministic eval preprocessing.
         train_ds = ClassifierImageDataset(train_df, data_root, get_train_transform(cfg["use_aug"]))
         val_ds = ClassifierImageDataset(val_df, data_root, get_eval_transform())
         test_ds = ClassifierImageDataset(test_df, data_root, get_eval_transform())
+        # pin_memory speeds host -> GPU copies when CUDA is available.
         train_loader = DataLoader(
             train_ds,
             batch_size=cfg["batch_size"],
@@ -286,7 +326,7 @@ def run():
         model = BaselineCNN(dropout=cfg["dropout"]).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
         best_path = CHECKPOINT_DIR / f"baseline_trial_{trial_idx:03d}.pt"
-        best_val_loss = train_loop(
+        best_val_loss = train(
             model=model,
             optimizer=optimizer,
             train_loader=train_loader,
@@ -306,9 +346,11 @@ def run():
         }
         torch.save(saved, best_path)
 
+        # Reload best val checkpoint into a fresh module so test reflects saved weights, not
+        # whatever the last training epoch left in memory.
         best_model = BaselineCNN(dropout=cfg["dropout"]).to(device)
         best_model.load_state_dict(saved["model_state_dict"])
-        test_stats = test_loop(best_model, test_loader, device)
+        test_stats = test(best_model, test_loader, device)
 
         print(f"best val loss (trial {trial_idx:03d}): {best_val_loss:.6f}")
         print(
