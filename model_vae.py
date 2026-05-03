@@ -11,13 +11,17 @@ from __future__ import annotations
 # data/raw/visa-anomaly-detection - see choose_data_root).
 # Training: Random search over hyperparameters (N_TRIALS). Each trial trains for EPOCHS,
 # checkpoints the best validation reconstruction MSE per trial under artifacts/vae/.
+# Per-trial train/val curves (recon, KL, total loss) are saved under artifacts/vae/plots/.
 # Optional test split is evaluated once per trial using the best checkpoint weights.
 # Preconditions: preprocessing (resize/normalize/aug) matches anomalydetect.get_*_transform
 # so VAE inputs stay consistent with the rest of the project.
 
 import random
 from pathlib import Path
+import matplotlib
 
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -129,6 +133,41 @@ def choose_data_root() -> Path:
     raise FileNotFoundError("Could not locate data root under data/raw")
 
 
+def save_vae_trial_curves(
+    history: dict[str, list[float]],
+    out_path: Path,
+    trial_idx: int,
+    beta: float,
+) -> None:
+    """Write train vs val recon / KL / total loss for one random-search trial (headless-safe)."""
+    epochs = history["epoch"]
+    fig, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
+    axes[0].plot(epochs, history["train_recon"], label="train", lw=2)
+    axes[0].plot(epochs, history["val_recon"], label="val", lw=2)
+    axes[0].set_ylabel("recon MSE")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(epochs, history["train_kld"], label="train", lw=2)
+    axes[1].plot(epochs, history["val_kld"], label="val", lw=2)
+    axes[1].set_ylabel("KL (q(z|x) vs N(0,I))")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(epochs, history["train_loss"], label="train", lw=2)
+    axes[2].plot(epochs, history["val_loss"], label="val", lw=2)
+    axes[2].set_ylabel("total loss\n(recon + beta*KL)")
+    axes[2].set_xlabel("epoch")
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    fig.suptitle(f"VAE random-search trial {trial_idx:03d} (beta={beta:.4g})")
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 # One epoch = full train pass + full val pass. Objective: reconstruction MSE + beta * KL.
 # beta trades off reconstruction fidelity vs a standard-normal latent prior (beta-VAE style).
 def train(
@@ -140,10 +179,19 @@ def train(
     beta: float,
     epochs: int,
     best_path: Path,
-) -> float:
+) -> tuple[float, dict[str, list[float]]]:
     # Checkpoint on val reconstruction loss (not combined loss) because we mainly care how well images
     # reconstruct; KL can dominate the summed loss depending on beta.
     best_val_recon = float("inf")
+    history: dict[str, list[float]] = {
+        "epoch": [],
+        "train_loss": [],
+        "train_recon": [],
+        "train_kld": [],
+        "val_loss": [],
+        "val_recon": [],
+        "val_kld": [],
+    }
 
     for epoch in range(1, epochs + 1):
         model.train(True)
@@ -200,6 +248,14 @@ def train(
             "kld": val_total_kld / max(val_batches, 1),
         }
 
+        history["epoch"].append(float(epoch))
+        history["train_loss"].append(train_stats["loss"])
+        history["train_recon"].append(train_stats["recon"])
+        history["train_kld"].append(train_stats["kld"])
+        history["val_loss"].append(val_stats["loss"])
+        history["val_recon"].append(val_stats["recon"])
+        history["val_kld"].append(val_stats["kld"])
+
         print(
             f"  epoch {epoch:03d} | "
             f"train loss {train_stats['loss']:.6f} (recon {train_stats['recon']:.6f}, kld {train_stats['kld']:.6f}) | "
@@ -218,7 +274,7 @@ def train(
                 best_path,
             )
 
-    return best_val_recon
+    return best_val_recon, history
 
 
 # Held-out metrics only; no gradients. Uses same beta as training trial for comparable loss scale.
@@ -267,6 +323,7 @@ def run():
         torch.cuda.manual_seed_all(SEED)
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    plots_dir = CHECKPOINT_DIR / "plots"
     rng = random.Random(SEED)
     best_overall = {"val_recon": float("inf"), "trial": None, "path": None, "config": None}
     print(f"Random search: trials={N_TRIALS}, epochs={EPOCHS}, device={device}")
@@ -319,7 +376,7 @@ def run():
         model = ConvVAE(latent_dim=cfg["latent_dim"]).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
         best_path = CHECKPOINT_DIR / f"vae_trial_{trial_idx:03d}.pt"
-        best_val_recon = train(
+        best_val_recon, history = train(
             model=model,
             optimizer=optimizer,
             train_loader=train_loader,
@@ -330,6 +387,9 @@ def run():
             best_path=best_path,
         )
 
+        curve_path = plots_dir / f"vae_trial_{trial_idx:03d}.png"
+        save_vae_trial_curves(history, curve_path, trial_idx, cfg["beta"])
+
         saved = torch.load(best_path, map_location="cpu")
         # Persist full trial metadata next to best weights so you know how each checkpoint was trained.
         saved["config"] = {**cfg, "seed": SEED, "epochs": EPOCHS, "num_workers": NUM_WORKERS, "trial_index": trial_idx}
@@ -337,6 +397,7 @@ def run():
 
         print(f"best val recon (trial {trial_idx:03d}): {best_val_recon:.6f}")
         print(f"checkpoint: {best_path}")
+        print(f"training curves: {curve_path}")
 
         if best_val_recon < best_overall["val_recon"]:
             best_overall = {"val_recon": best_val_recon, "trial": trial_idx, "path": best_path, "config": cfg}
