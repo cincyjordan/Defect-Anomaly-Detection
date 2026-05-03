@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+from typing import Any
+
 # Baseline binary classifier: VisA normal vs anomaly.
+
+# Resume + Slurm: if a job hits TIME LIMIT mid-search, rerun with determinism preserved, e.g.:
+#   rm -f artifacts/classifier/baseline_trial_007.pt   # optional, if that trial did not finish
+#   python classifier.py --start-trial 7
+# Ask for enough walltime on GPU (sbatch/srun): e.g. #SBATCH --time=08:00:00 (cluster-specific).
 
 # Purpose: Establish a benchmark before adding VAE-generated synthetic defects. Same
 # preprocessing as anomalydetect.py ensures fair comparison later when augmenting train.
@@ -12,6 +19,7 @@ from __future__ import annotations
 # best weights by lowest validation BCE loss under artifacts/classifier/. Test metrics
 # include PR-AUC / ROC-AUC because accuracy alone is misleading under class imbalance.
 
+import argparse
 import random
 from pathlib import Path
 
@@ -47,6 +55,40 @@ LR_LOG10_RANGE = (-4.3, -2.7)  # ~5e-5 to ~2e-3
 BATCH_SIZE_CHOICES = [16, 32, 64]
 DROPOUT_CHOICES = [0.1, 0.2, 0.3, 0.4]
 USE_AUG_CHOICES = [False, True]
+
+
+def sample_classifier_trial_cfg(rng: random.Random) -> dict:
+    """One random-search draw; must stay in sync across runs for reproducible resumes."""
+    return {
+        "lr": 10 ** rng.uniform(*LR_LOG10_RANGE),
+        "batch_size": rng.choice(BATCH_SIZE_CHOICES),
+        "dropout": rng.choice(DROPOUT_CHOICES),
+        "use_aug": rng.choice(USE_AUG_CHOICES),
+    }
+
+
+def best_overall_from_saved_trials(checkpoint_dir: Path, start_exclusive: int) -> dict[str, Any]:
+    """Load best_val_loss (+ path, config if present) from completed checkpoints 000 .. start_exclusive-1."""
+    best_overall: dict[str, Any] = {
+        "val_loss": float("inf"),
+        "trial": None,
+        "path": None,
+        "config": None,
+    }
+    for trial_idx in range(start_exclusive):
+        path = checkpoint_dir / f"baseline_trial_{trial_idx:03d}.pt"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Resume needs prior checkpoint for trial {trial_idx:03d}: {path} "
+                f"(finish earlier trials first, or lower --start-trial)."
+            )
+        saved = torch.load(path, map_location="cpu")
+        vloss = float(saved["best_val_loss"])
+        cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+        candidate = {"val_loss": vloss, "trial": trial_idx, "path": path, "config": cfg or None}
+        if vloss < best_overall["val_loss"]:
+            best_overall = candidate
+    return best_overall
 
 
 # PyTorch Dataset wrapping one split DataFrame: loads RGB, applies transform, returns label.
@@ -255,10 +297,17 @@ def test(model: nn.Module, test_loader: DataLoader, device: torch.device) -> dic
     }
 
 
-def run():
+def run(start_trial: int = 0, end_trial_exclusive: int | None = None) -> None:
     # End-to-end: load splits -> for each sampled hyperparam set, train with early-like
     # selection via best val loss checkpoint -> evaluate best weights on test -> track which
     # trial minimized validation loss across the whole search.
+    global_end = N_TRIALS if end_trial_exclusive is None else end_trial_exclusive
+    if start_trial < 0 or global_end > N_TRIALS or start_trial >= global_end:
+        raise ValueError(
+            f"Need 0 <= start_trial < end_trial_exclusive <= N_TRIALS ({N_TRIALS}); "
+            f"got start_trial={start_trial}, end_trial_exclusive={global_end}"
+        )
+
     if not CLASSIFIER_SPLIT_CSV.is_file():
         raise FileNotFoundError(f"Missing classifier split CSV: {CLASSIFIER_SPLIT_CSV}")
 
@@ -278,18 +327,26 @@ def run():
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     rng = random.Random(SEED)
-    # Tracks the single trial with lowest validation loss (not necessarily best test metrics).
-    best_overall = {"val_loss": float("inf"), "trial": None, "path": None, "config": None}
-    print(f"Baseline classifier random search: trials={N_TRIALS}, epochs={EPOCHS}, device={device}")
+    for _ in range(start_trial):
+        sample_classifier_trial_cfg(rng)
 
-    for trial_idx in range(N_TRIALS):
-        # Sample one hyperparameter configuration for this trial.
-        cfg = {
-            "lr": 10 ** rng.uniform(*LR_LOG10_RANGE),
-            "batch_size": rng.choice(BATCH_SIZE_CHOICES),
-            "dropout": rng.choice(DROPOUT_CHOICES),
-            "use_aug": rng.choice(USE_AUG_CHOICES),
+    if start_trial == 0:
+        best_overall: dict[str, Any] = {
+            "val_loss": float("inf"),
+            "trial": None,
+            "path": None,
+            "config": None,
         }
+    else:
+        best_overall = best_overall_from_saved_trials(CHECKPOINT_DIR, start_trial)
+
+    print(
+        f"Baseline classifier random search: trials [{start_trial:03d}, {global_end:03d}), "
+        f"full search has N_TRIALS={N_TRIALS}, epochs={EPOCHS}, device={device}"
+    )
+
+    for trial_idx in range(start_trial, global_end):
+        cfg = sample_classifier_trial_cfg(rng)
         print(f"\nTrial {trial_idx:03d}")
         print(
             f"cfg: lr={cfg['lr']:.6g}, batch_size={cfg['batch_size']}, "
@@ -369,7 +426,7 @@ def run():
         )
         print(f"checkpoint: {best_path}")
 
-        if best_val_loss < best_overall["val_loss"]:
+        if best_val_loss < float(best_overall["val_loss"]):
             best_overall = {"val_loss": best_val_loss, "trial": trial_idx, "path": best_path, "config": cfg}
 
     print("\nRandom search complete.")
@@ -379,8 +436,25 @@ def run():
     print(f"Best config: {best_overall['config']}")
 
 
-def main():
-    run()
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train baseline classifier with random hyperparameter search.",
+    )
+    parser.add_argument(
+        "--start-trial",
+        type=int,
+        default=0,
+        help="First trial index to run [0, N_TRIALS). RNG is advanced as if trials before this ran.",
+    )
+    parser.add_argument(
+        "--end-trial-exclusive",
+        type=int,
+        default=None,
+        help=f"Exclusive end trial index (default: {N_TRIALS}). Example: "
+        "`--start-trial 7` runs trials 007..009 when N_TRIALS=10.",
+    )
+    args = parser.parse_args()
+    run(start_trial=args.start_trial, end_trial_exclusive=args.end_trial_exclusive)
 
 
 if __name__ == "__main__":
