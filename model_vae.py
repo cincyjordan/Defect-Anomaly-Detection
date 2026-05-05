@@ -9,15 +9,21 @@ from __future__ import annotations
 # Data layout: anomalydetect.py writes data/processed/vae/split_assignments.csv and
 # mirrored folders; this file reads that CSV. Image paths are relative to data/raw (or
 # data/raw/visa-anomaly-detection - see choose_data_root).
-# Training: Random search over hyperparameters (N_TRIALS). Each trial trains for EPOCHS,
-# checkpoints the best validation reconstruction MSE per trial under artifacts/vae/.
-# Per-trial train/val curves (recon, KL, total loss) are saved under artifacts/vae/plots/.
+# Training: each VisA object (category) trains its own VAE only on anomalies for that
+# object - avoids one global manifold averaging unrelated products together.
+# Random search (N_TRIALS) runs per object; checkpoints land under artifacts/vae/<object>/.
+# Per-trial curves: artifacts/vae/plots/<object>/…
+#
+# After all objects finish, random decoder samples from each object's best trial are saved
+# under data/generated/vae_defects/ as <object>_best_sample_*.png (no-post-samples to skip).
 # Optional test split is evaluated once per trial using the best checkpoint weights.
 # Preconditions: preprocessing (resize/normalize/aug) matches anomalydetect.get_*_transform
 # so VAE inputs stay consistent with the rest of the project.
 
 import random
+import zlib
 from pathlib import Path
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -28,12 +34,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torchvision.utils import save_image
 
-from anomalydetect import IMAGE_SIZE, get_eval_transform, get_train_transform
+from anomalydetect import IMAGE_SIZE, NORMALIZE_MEAN, NORMALIZE_STD, get_eval_transform, get_train_transform
 
 VAE_SPLIT_CSV = Path("data/processed/vae/split_assignments.csv")
 RAW_ROOT = Path("data/raw")
 CHECKPOINT_DIR = Path("artifacts/vae")
+# Post-training decoder samples per object best checkpoint (for inspection + classifier CSV).
+SYNTH_IMAGE_DIR_DEFAULT = Path("data/generated/vae_defects")
+POST_TRAIN_NUM_SAMPLES = 10
 
 # Reproducibility for sampled hyperparameters and PyTorch RNG.
 SEED = 42
@@ -133,11 +143,63 @@ def choose_data_root() -> Path:
     raise FileNotFoundError("Could not locate data root under data/raw")
 
 
+def denormalized_to_rgb01(batch: torch.Tensor) -> torch.Tensor:
+    """Invert ImageNet-style normalize used across this project (see anomalydetect transforms)."""
+    mean = batch.new_tensor(NORMALIZE_MEAN).view(1, -1, 1, 1)
+    std = batch.new_tensor(NORMALIZE_STD).view(1, -1, 1, 1)
+    return torch.clamp(batch * std + mean, 0.0, 1.0)
+
+
+def save_decoder_random_pngs(
+    checkpoint_path: Path,
+    output_dir: Path,
+    *,
+    num: int,
+    seed: int,
+    stem_prefix: str,
+    device: torch.device | None = None,
+) -> None:
+    """Load best checkpoint, decode num random priors z ~ N(0,I), save PNGs under output_dir."""
+    if num <= 0:
+        return
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Missing checkpoint for sampling: {checkpoint_path}")
+
+    payload = torch.load(checkpoint_path, map_location=device)
+    cfg = payload.get("config") or {}
+    latent_dim = int(cfg.get("latent_dim", 128))
+    if latent_dim <= 0:
+        raise ValueError("Checkpoint missing valid config['latent_dim'].")
+
+    torch.manual_seed(int(seed))
+
+    model = ConvVAE(latent_dim=latent_dim).to(device)
+    model.load_state_dict(payload["model_state_dict"])
+    model.eval()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem_prefix_safe = stem_prefix.replace(".", "_")
+    with torch.no_grad():
+        for i in range(num):
+            z = torch.randn(1, latent_dim, device=device)
+            recon = model.decode(z)
+            rgb = denormalized_to_rgb01(recon)
+            out_path = output_dir / f"{stem_prefix_safe}_sample_{i:03d}.png"
+            save_image(rgb, out_path)
+
+
+def effective_batch_size(requested_bs: int, dataset_len: int) -> int:
+    return max(1, min(requested_bs, dataset_len))
+
+
 def save_vae_trial_curves(
     history: dict[str, list[float]],
     out_path: Path,
     trial_idx: int,
     beta: float,
+    object_label: str | None = None,
 ) -> None:
     """Write train vs val recon / KL / total loss for one random-search trial (headless-safe)."""
     epochs = history["epoch"]
@@ -161,7 +223,8 @@ def save_vae_trial_curves(
     axes[2].legend()
     axes[2].grid(True, alpha=0.3)
 
-    fig.suptitle(f"VAE random-search trial {trial_idx:03d} (beta={beta:.4g})")
+    pref = f"{object_label} — " if object_label else ""
+    fig.suptitle(f"{pref}VAE trial {trial_idx:03d} (beta={beta:.4g})")
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -302,7 +365,11 @@ def test(model: nn.Module, test_loader: DataLoader, device: torch.device, beta: 
     }
 
 
-def run():
+def run(
+    *,
+    synth_image_dir: Path = SYNTH_IMAGE_DIR_DEFAULT,
+    post_train_num_samples: int = POST_TRAIN_NUM_SAMPLES,
+) -> None:
     # Load splits produced by anomalydetect (VAE-specific stratified split on anomalies).
     if not VAE_SPLIT_CSV.is_file():
         raise FileNotFoundError(f"Missing VAE split CSV: {VAE_SPLIT_CSV}")
@@ -314,7 +381,6 @@ def run():
     if train_df.empty or val_df.empty:
         raise RuntimeError("VAE train/val splits are empty.")
 
-
     data_root = choose_data_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     random.seed(SEED)
@@ -325,101 +391,181 @@ def run():
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     plots_dir = CHECKPOINT_DIR / "plots"
     rng = random.Random(SEED)
-    best_overall = {"val_recon": float("inf"), "trial": None, "path": None, "config": None}
-    print(f"Random search: trials={N_TRIALS}, epochs={EPOCHS}, device={device}")
+    objects_sorted = sorted(str(x) for x in train_df["object"].dropna().unique())
 
-    for trial_idx in range(N_TRIALS):
-        # Fresh model + optimizer per trial; no weight carry-over between random configs.
-        cfg = {
-            "lr": 10 ** rng.uniform(*LR_LOG10_RANGE),
-            "batch_size": rng.choice(BATCH_SIZE_CHOICES),
-            "latent_dim": rng.choice(LATENT_DIM_CHOICES),
-            "beta": 10 ** rng.uniform(*BETA_LOG10_RANGE),
-            "use_aug": rng.choice(USE_AUG_CHOICES),
+    print(
+        f"Per-object random search: objects={len(objects_sorted)}, trials={N_TRIALS}, "
+        f"epochs={EPOCHS}, device={device}"
+    )
+
+    per_object_best: list[dict[str, object]] = []
+
+    for obj in objects_sorted:
+        train_o = train_df[train_df["object"].astype(str) == obj].copy()
+        val_o = val_df[val_df["object"].astype(str) == obj].copy()
+        test_o = test_df[test_df["object"].astype(str) == obj].copy()
+
+        if train_o.empty:
+            print(f"\nSkipping object={obj}: no train anomalies.")
+            continue
+        if val_o.empty:
+            print(f"\nSkipping object={obj}: no val anomalies (needed for reconstruction checkpoint).")
+            continue
+
+        obj_ckpt_root = CHECKPOINT_DIR / obj
+        obj_ckpt_root.mkdir(parents=True, exist_ok=True)
+        plots_o = plots_dir / obj
+
+        print(f"\n======== Object: {obj} | train {len(train_o)} | val {len(val_o)} | test {len(test_o)} ==========")
+
+        best_for_obj = {
+            "val_recon": float("inf"),
+            "trial": None,
+            "path": None,
+            "config": None,
         }
-        print(f"\nTrial {trial_idx:03d}")
-        print(
-            f"cfg: lr={cfg['lr']:.6g}, batch_size={cfg['batch_size']}, "
-            f"latent_dim={cfg['latent_dim']}, beta={cfg['beta']:.4f}, use_aug={cfg['use_aug']}"
-        )
 
-        # Train: optional mild aug; val/test: fixed transform so metrics are comparable.
-        train_ds = AnomalyImageDataset(train_df, data_root, get_train_transform(cfg["use_aug"]))
-        val_ds = AnomalyImageDataset(val_df, data_root, get_eval_transform())
-        test_ds = AnomalyImageDataset(test_df, data_root, get_eval_transform()) if not test_df.empty else None
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=cfg["batch_size"],
-            shuffle=True,
-            num_workers=NUM_WORKERS,
-            pin_memory=torch.cuda.is_available(),  # speeds host->device copies when CUDA is used
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=cfg["batch_size"],
-            shuffle=False,
-            num_workers=NUM_WORKERS,
-            pin_memory=torch.cuda.is_available(),
-        )
-        test_loader = (
-            DataLoader(
-                test_ds,
-                batch_size=cfg["batch_size"],
+        for trial_idx in range(N_TRIALS):
+            cfg = {
+                "lr": 10 ** rng.uniform(*LR_LOG10_RANGE),
+                "batch_size": rng.choice(BATCH_SIZE_CHOICES),
+                "latent_dim": rng.choice(LATENT_DIM_CHOICES),
+                "beta": 10 ** rng.uniform(*BETA_LOG10_RANGE),
+                "use_aug": rng.choice(USE_AUG_CHOICES),
+            }
+            bs_train = effective_batch_size(cfg["batch_size"], len(train_o))
+            bs_val = effective_batch_size(cfg["batch_size"], len(val_o))
+            bs_test = effective_batch_size(cfg["batch_size"], len(test_o))
+
+            print(f"\n  Trial {trial_idx:03d} ({obj})")
+            print(
+                f"  cfg: lr={cfg['lr']:.6g}, batch_size(train/val/test)={bs_train}/{bs_val}/{bs_test}, "
+                f"latent_dim={cfg['latent_dim']}, beta={cfg['beta']:.4f}, use_aug={cfg['use_aug']}"
+            )
+
+            train_ds = AnomalyImageDataset(train_o, data_root, get_train_transform(cfg["use_aug"]))
+            val_ds = AnomalyImageDataset(val_o, data_root, get_eval_transform())
+            test_ds = AnomalyImageDataset(test_o, data_root, get_eval_transform()) if not test_o.empty else None
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=bs_train,
+                shuffle=True,
+                num_workers=NUM_WORKERS,
+                pin_memory=torch.cuda.is_available(),
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=bs_val,
                 shuffle=False,
                 num_workers=NUM_WORKERS,
                 pin_memory=torch.cuda.is_available(),
             )
-            if test_ds is not None
-            else None
-        )
-
-        model = ConvVAE(latent_dim=cfg["latent_dim"]).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-        best_path = CHECKPOINT_DIR / f"vae_trial_{trial_idx:03d}.pt"
-        best_val_recon, history = train(
-            model=model,
-            optimizer=optimizer,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device=device,
-            beta=cfg["beta"],
-            epochs=EPOCHS,
-            best_path=best_path,
-        )
-
-        curve_path = plots_dir / f"vae_trial_{trial_idx:03d}.png"
-        save_vae_trial_curves(history, curve_path, trial_idx, cfg["beta"])
-
-        saved = torch.load(best_path, map_location="cpu")
-        # Persist full trial metadata next to best weights so you know how each checkpoint was trained.
-        saved["config"] = {**cfg, "seed": SEED, "epochs": EPOCHS, "num_workers": NUM_WORKERS, "trial_index": trial_idx}
-        torch.save(saved, best_path)
-
-        print(f"best val recon (trial {trial_idx:03d}): {best_val_recon:.6f}")
-        print(f"checkpoint: {best_path}")
-        print(f"training curves: {curve_path}")
-
-        if best_val_recon < best_overall["val_recon"]:
-            best_overall = {"val_recon": best_val_recon, "trial": trial_idx, "path": best_path, "config": cfg}
-
-        if test_loader is not None:
-            # Rebuild a clean module and load best weights (optimizer state is not needed for eval).
-            best_model = ConvVAE(latent_dim=cfg["latent_dim"]).to(device)
-            best_model.load_state_dict(saved["model_state_dict"])
-            test_stats = test(best_model, test_loader, device, cfg["beta"])
-            print(
-                f"test loss {test_stats['loss']:.6f} "
-                f"(recon {test_stats['recon']:.6f}, kld {test_stats['kld']:.6f})"
+            test_loader = (
+                DataLoader(
+                    test_ds,
+                    batch_size=bs_test,
+                    shuffle=False,
+                    num_workers=NUM_WORKERS,
+                    pin_memory=torch.cuda.is_available(),
+                )
+                if test_ds is not None
+                else None
             )
-        else:
-            print("No test split found; skipped test loop.")
 
-    print("\nRandom search complete.")
-    print(f"Best trial: {best_overall['trial']}")
-    print(f"Best val recon loss: {best_overall['val_recon']:.6f}")
-    print(f"Best checkpoint: {best_overall['path']}")
-    print(f"Best config: {best_overall['config']}")
+            model = ConvVAE(latent_dim=cfg["latent_dim"]).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+            best_path = obj_ckpt_root / f"vae_trial_{trial_idx:03d}.pt"
+            best_val_recon, history = train(
+                model=model,
+                optimizer=optimizer,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                beta=cfg["beta"],
+                epochs=EPOCHS,
+                best_path=best_path,
+            )
+
+            curve_path = plots_o / f"vae_trial_{trial_idx:03d}.png"
+            save_vae_trial_curves(history, curve_path, trial_idx, cfg["beta"], object_label=obj)
+
+            saved = torch.load(best_path, map_location="cpu")
+            saved["config"] = {
+                **cfg,
+                "object": obj,
+                "seed": SEED,
+                "epochs": EPOCHS,
+                "num_workers": NUM_WORKERS,
+                "trial_index": trial_idx,
+            }
+            torch.save(saved, best_path)
+
+            print(f"  best val recon: {best_val_recon:.6f}")
+            print(f"  checkpoint: {best_path}")
+            print(f"  training curves: {curve_path}")
+
+            if best_val_recon < float(best_for_obj["val_recon"]):
+                best_for_obj = {
+                    "val_recon": best_val_recon,
+                    "trial": trial_idx,
+                    "path": best_path,
+                    "config": cfg.copy(),
+                }
+
+            if test_loader is not None:
+                best_model = ConvVAE(latent_dim=cfg["latent_dim"]).to(device)
+                best_model.load_state_dict(saved["model_state_dict"])
+                test_stats = test(best_model, test_loader, device, cfg["beta"])
+                print(
+                    f"  test loss {test_stats['loss']:.6f} "
+                    f"(recon {test_stats['recon']:.6f}, kld {test_stats['kld']:.6f})"
+                )
+            else:
+                print("  No test split for this object; skipped test.")
+
+        print(
+            f"\n>>> {obj} BEST : trial={best_for_obj['trial']} | "
+            f"val recon={best_for_obj['val_recon']:.6f} | checkpoint={best_for_obj['path']}"
+        )
+
+        per_object_best.append(best_for_obj | {"object": obj})
+
+    print("\nPer-object random search complete.")
+    for row in per_object_best:
+        print(
+            f"  object={row['object']!r} | best_trial={row['trial']} | "
+            f"val_recon={row['val_recon']:.6f} | {row['path']}"
+        )
+
+    if post_train_num_samples > 0 and per_object_best:
+        synth_image_dir = synth_image_dir.resolve()
+        synth_image_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"\nSaving decoder samples ({post_train_num_samples} each) under {synth_image_dir.resolve()} ..."
+        )
+        for row in per_object_best:
+            if row["path"] is None:
+                continue
+            obj = str(row["object"])
+            obj_seed = (SEED + zlib.adler32(obj.encode())) & 0xFFFFFFFF
+            save_decoder_random_pngs(
+                Path(row["path"]),
+                synth_image_dir,
+                num=post_train_num_samples,
+                seed=obj_seed,
+                stem_prefix=f"{obj}_best",
+                device=device,
+            )
+        print("Done.")
+
+    elif post_train_num_samples <= 0:
+        print("\nSkipping post-training decoder PNGs (--no-post-samples).")
 
 
 if __name__ == "__main__":
-    run()
+    import sys
+
+    n_post = POST_TRAIN_NUM_SAMPLES
+    if "--no-post-samples" in sys.argv:
+        n_post = 0
+    run(post_train_num_samples=n_post)
