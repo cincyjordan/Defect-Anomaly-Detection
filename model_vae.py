@@ -103,14 +103,20 @@ class ConvVAE(nn.Module):
         self.fc_mu = nn.Linear(feat_dim, latent_dim)
         self.fc_logvar = nn.Linear(feat_dim, latent_dim)
         self.fc_decode = nn.Linear(latent_dim, feat_dim)
+        # avoid checkerboard artifacts from transposed conv by using
+        # nearest-neighbor upsampling followed by standard 3x3 convs.
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 3, 4, 2, 1),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(32, 3, kernel_size=3, padding=1),
             nn.Sigmoid(),
         )
 
@@ -233,6 +239,14 @@ def save_vae_trial_curves(
 
 # One epoch = full train pass + full val pass. Objective: reconstruction MSE + beta * KL.
 # beta trades off reconstruction fidelity vs a standard-normal latent prior (beta-VAE style).
+def get_beta(current_epoch: int, total_epochs: int, target_beta: float) -> float:
+    # Fix 3: KL warmup over first 40% epochs, then keep target beta.
+    warmup_epochs = max(1, int(0.4 * total_epochs))
+    if current_epoch <= warmup_epochs:
+        return float(target_beta) * (current_epoch / warmup_epochs)
+    return float(target_beta)
+
+
 def train(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -257,6 +271,7 @@ def train(
     }
 
     for epoch in range(1, epochs + 1):
+        beta_now = get_beta(epoch, epochs, beta)
         model.train(True)
         train_total_loss = 0.0
         train_total_recon = 0.0
@@ -269,7 +284,7 @@ def train(
             recon_loss = F.mse_loss(recon, x, reduction="mean")
             # Analytic KL for q(z|x) vs N(0,I) when q is diagonal Gaussian.
             kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = recon_loss + beta * kld
+            loss = recon_loss + beta_now * kld
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -298,7 +313,7 @@ def train(
                 recon, mu, logvar = model(x)
                 recon_loss = F.mse_loss(recon, x, reduction="mean")
                 kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = recon_loss + beta * kld
+                loss = recon_loss + beta_now * kld
 
                 val_total_loss += float(loss.item())
                 val_total_recon += float(recon_loss.item())
@@ -321,6 +336,7 @@ def train(
 
         print(
             f"  epoch {epoch:03d} | "
+            f"beta {beta_now:.4f} | "
             f"train loss {train_stats['loss']:.6f} (recon {train_stats['recon']:.6f}, kld {train_stats['kld']:.6f}) | "
             f"val loss {val_stats['loss']:.6f} (recon {val_stats['recon']:.6f}, kld {val_stats['kld']:.6f})"
         )
