@@ -44,6 +44,7 @@ RAW_ROOT = Path("data/raw")
 CHECKPOINT_DIR = Path("artifacts/vae")
 # Post-training decoder samples per object best checkpoint (for inspection + classifier CSV).
 SYNTH_IMAGE_DIR_DEFAULT = Path("data/generated/vae_defects")
+CUTPASTE_SYNTH_ROOT = Path("data/generated/cutpaste_defects")
 POST_TRAIN_NUM_SAMPLES = 10
 
 # Reproducibility for sampled hyperparameters and PyTorch RNG.
@@ -74,7 +75,10 @@ class AnomalyImageDataset(Dataset):
 
     def __getitem__(self, idx: int):
         rel = str(self.frame.iloc[idx]["image"]).replace("\\", "/").lstrip("/")
-        path = self.data_root / rel
+        if rel.startswith("generated/"):
+            path = Path("data") / rel
+        else:
+            path = self.data_root / rel
         img = Image.open(path)
         x = self.transform(img)
         # Return rel for debugging only; training loops ignore the string.
@@ -158,7 +162,7 @@ def denormalized_to_rgb01(batch: torch.Tensor) -> torch.Tensor:
 def get_vae_eval_transform() -> transforms.Compose:
     return transforms.Compose([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
 
-#VAE-only train pipeline: [0,1] via ToTensor; no Normalization, Flips, Rotations, Color Jitter, Resized Crop, Grayscale. Strong augmentation when use_aug=True.
+# More conservative VAE train augmentation on [0,1] scale (no normalization).
 def get_vae_train_transform(use_augmentation: bool = False) -> transforms.Compose:
     steps: list[transforms.Transform] = []
     if use_augmentation:
@@ -166,10 +170,7 @@ def get_vae_train_transform(use_augmentation: bool = False) -> transforms.Compos
             [
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
-                transforms.RandomRotation(degrees=30),
-                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
-                transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.8, 1.0)),
-                transforms.RandomGrayscale(p=0.05),
+                transforms.RandomRotation(degrees=10),
             ]
         )
     steps.extend([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
@@ -440,6 +441,19 @@ def run(
         train_o = train_df[train_df["object"].astype(str) == obj].copy()
         val_o = val_df[val_df["object"].astype(str) == obj].copy()
         test_o = test_df[test_df["object"].astype(str) == obj].copy()
+
+        cutpaste_obj_dir = CUTPASTE_SYNTH_ROOT / obj
+        cutpaste_paths = sorted(p for p in cutpaste_obj_dir.glob("*.png") if p.is_file())
+        if cutpaste_paths:
+            cutpaste_rows = pd.DataFrame(
+                {
+                    "image": [f"generated/cutpaste_defects/{obj}/{p.name}" for p in cutpaste_paths],
+                    "split": "train",
+                    "object": obj,
+                }
+            )
+            train_o = pd.concat([train_o, cutpaste_rows], ignore_index=True)
+            print(f"  Added {len(cutpaste_rows)} CutPaste train images for object={obj!r}.")
 
         if train_o.empty:
             print(f"\nSkipping object={obj}: no train anomalies.")
