@@ -4,6 +4,13 @@ then stratified train/val/test 60/20/20 by binary class (normal vs anomaly).
 Writes split_assignments.csv and copies each image under data/processed/by_split/{train,val,test}/…
 
 Run: python anomalydetect.py
+
+Augmented classifier (real splits + synth train defects under data/generated/...):
+  python sample_vae.py
+  python anomalydetect.py --build-augmented-classifier
+  python anomalydetect.py --build-augmented-classifier --synthetic-dir data/generated/vae_defects
+
+Then train with: python classifier.py --split-assignments data/processed/classifier_augmented/split_assignments.csv
 """
 
 from __future__ import annotations
@@ -22,6 +29,10 @@ OUTPUT_DIR = Path("data/raw")
 CLASSIFIER_ROOT = Path("data/processed/classifier")
 CLASSIFIER_SPLIT_OUT = CLASSIFIER_ROOT / "split_assignments.csv"
 CLASSIFIER_BY_SPLIT_ROOT = CLASSIFIER_ROOT / "by_split"
+# Second classifier: same val/test CSV rows as classifier; train rows + VAE synth under data/generated/...
+CLASSIFIER_AUG_ROOT = Path("data/processed/classifier_augmented")
+CLASSIFIER_AUG_SPLIT_OUT = CLASSIFIER_AUG_ROOT / "split_assignments.csv"
+CLASSIFIER_AUG_BY_SPLIT_ROOT = CLASSIFIER_AUG_ROOT / "by_split"
 VAE_ROOT = Path("data/processed/vae")
 VAE_SPLIT_OUT = VAE_ROOT / "split_assignments.csv"
 VAE_BY_SPLIT_ROOT = VAE_ROOT / "by_split"
@@ -68,7 +79,137 @@ def get_train_transform(use_augmentation: bool = False) -> transforms.Compose:
     )
     return transforms.Compose(steps)
 
+
+def discover_visa_raw_root(out: Path | None = None) -> Path:
+    """Locate VisA extract root (either data/raw/... or data/raw/visa-anomaly-detection/...)."""
+    out_res = OUTPUT_DIR.resolve() if out is None else out.resolve()
+    data_root: Path | None = None
+    for candidate in (out_res, out_res / DOWNLOADED_FOLDER):
+        if not candidate.is_dir():
+            continue
+        for child in candidate.iterdir():
+            if child.is_dir() and (child / "image_anno.csv").is_file():
+                data_root = candidate
+                break
+        if data_root is not None:
+            break
+    if data_root is None:
+        raise FileNotFoundError(
+            f"No dataset found under {out_res} (expected category folders with image_anno.csv)."
+        )
+    return data_root
+
+
+def build_classifier_augmented_split(
+    synthetic_dir: Path,
+    classifier_base_csv: Path = CLASSIFIER_SPLIT_OUT,
+    out_csv: Path = CLASSIFIER_AUG_SPLIT_OUT,
+    mirror_root: Path = CLASSIFIER_AUG_BY_SPLIT_ROOT,
+    force_rebuild_mirror: bool = True,
+) -> None:
+    """
+    Writes data/processed/classifier_augmented/split_assignments.csv =
+    canonical classifier splits + synthetic defect rows as extra train anomalies.
+
+    Synth files must live under `synthetic_dir` (typically data/generated/vae_defects).
+    CSV paths are stored relative to repo `data/` (e.g. generated/vae_defects/foo.png) so
+    classifier.py resolves them via resolve_classifier_image_path.
+    """
+    if not classifier_base_csv.is_file():
+        raise FileNotFoundError(
+            f"Missing base classifier CSV. Run anomalydetect first: {classifier_base_csv}"
+        )
+    synth_resolved = synthetic_dir.resolve()
+    if not synth_resolved.is_dir():
+        raise FileNotFoundError(f"Synthetic directory not found or not a folder: {synthetic_dir}")
+
+    data_anchor = Path("data").resolve()
+    try:
+        rel_prefix = synth_resolved.relative_to(data_anchor)
+    except ValueError as e:
+        raise ValueError(
+            f"Synthetic dir must be under project's data/: {synthetic_dir}"
+        ) from e
+
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    synth_paths = sorted(p for p in synth_resolved.rglob("*") if p.is_file() and p.suffix.lower() in exts)
+    if not synth_paths:
+        raise FileNotFoundError(
+            f"No image files ({exts}) under {synthetic_dir}. Run model_vae / sample_vae first."
+        )
+
+    base_df = pd.read_csv(classifier_base_csv)
+    required = {"image", "label", "mask", "object", "binary_label", "split"}
+    missing = required - set(base_df.columns)
+    if missing:
+        raise ValueError(f"Base classifier CSV missing columns {missing}")
+
+    def infer_synthetic_object(rel_under_synth_dir: Path) -> str:
+        """Match VisA `object` when synth lives in subdirs or uses `<object>_best_sample_*.png` names."""
+        parts = rel_under_synth_dir.parts
+        if len(parts) > 1:
+            return str(parts[0])
+        stem = rel_under_synth_dir.stem
+        marker = "_best_sample_"
+        if marker in stem:
+            return stem.split(marker, 1)[0]
+        return "vae_synthetic"
+
+    synth_rows = []
+    for fp in synth_paths:
+        rel_inside = fp.relative_to(synth_resolved)
+        posix_rel = f"{rel_prefix.as_posix().rstrip('/')}/{rel_inside.as_posix()}"
+        synth_rows.append(
+            {
+                "image": posix_rel,
+                "label": "anomaly",
+                "mask": "",
+                "object": infer_synthetic_object(rel_inside),
+                "binary_label": "anomaly",
+                "split": "train",
+            }
+        )
+    synth_df = pd.DataFrame(synth_rows)
+    aug_df = pd.concat([base_df, synth_df], ignore_index=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    aug_df.to_csv(out_csv, index=False)
+    print(f"Wrote augmented classifier CSV: {out_csv} ({len(base_df)} real + {len(synth_df)} synth)")
+
+    raw_root = discover_visa_raw_root()
+    data_for_gen = Path("data")
+
+    if force_rebuild_mirror and mirror_root.exists():
+        shutil.rmtree(mirror_root)
+    mirror_root.mkdir(parents=True, exist_ok=True)
+    n_copied = 0
+    for _, row in aug_df.iterrows():
+        rel = str(row["image"]).replace("\\", "/").lstrip("/")
+        if rel.startswith("generated/"):
+            src = (data_for_gen / Path(rel)).resolve()
+        else:
+            src = (raw_root / rel).resolve()
+        if not src.is_file():
+            print(f"  skip mirror (missing file): {src}")
+            continue
+        dst = mirror_root / str(row["split"]) / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        n_copied += 1
+    print(f"Mirrored augmented split to {mirror_root}/{{train,val,test}}/… ({n_copied} files)")
+
+
 if __name__ == "__main__":
+    if "--build-augmented-classifier" in sys.argv:
+        synth_dir = Path("data/generated/vae_defects")
+        if "--synthetic-dir" in sys.argv:
+            i = sys.argv.index("--synthetic-dir")
+            if i + 1 >= len(sys.argv):
+                print("--synthetic-dir requires a path", file=sys.stderr)
+                raise SystemExit(2)
+            synth_dir = Path(sys.argv[i + 1])
+        build_classifier_augmented_split(synthetic_dir=synth_dir)
+        raise SystemExit(0)
+
     force_rebuild = "--force-rebuild" in sys.argv
     out = OUTPUT_DIR.resolve()
     data_root: Path | None = None
