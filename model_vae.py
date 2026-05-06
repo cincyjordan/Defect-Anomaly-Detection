@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ConvVAE trainer for VisA *defect-only* images.
+# ConvVAE trainer for VisA defect-only images.
 
 # The downstream classifier will be trained on normal + real defect images (and later
 # synthetic defects). This script models the distribution of real defects only, so the VAE
@@ -34,9 +34,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 from torchvision.utils import save_image
 
-from anomalydetect import IMAGE_SIZE, NORMALIZE_MEAN, NORMALIZE_STD, get_eval_transform, get_train_transform
+from anomalydetect import IMAGE_SIZE
 
 VAE_SPLIT_CSV = Path("data/processed/vae/split_assignments.csv")
 RAW_ROOT = Path("data/raw")
@@ -149,11 +150,26 @@ def choose_data_root() -> Path:
     raise FileNotFoundError("Could not locate data root under data/raw")
 
 
+# Decoder outputs are already in [0,1] (Sigmoid); keep as valid RGB range.
 def denormalized_to_rgb01(batch: torch.Tensor) -> torch.Tensor:
-    """Invert ImageNet-style normalize used across this project (see anomalydetect transforms)."""
-    mean = batch.new_tensor(NORMALIZE_MEAN).view(1, -1, 1, 1)
-    std = batch.new_tensor(NORMALIZE_STD).view(1, -1, 1, 1)
-    return torch.clamp(batch * std + mean, 0.0, 1.0)
+    return torch.clamp(batch, 0.0, 1.0)
+
+# Deterministic VAE preprocessing on [0,1] scale.
+def get_vae_eval_transform() -> transforms.Compose:
+    return transforms.Compose([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
+
+# VAE train preprocessing; optional mild augmentation, no normalization.
+def get_vae_train_transform(use_augmentation: bool = False) -> transforms.Compose:
+    steps: list = [transforms.Resize(IMAGE_SIZE)]
+    if use_augmentation:
+        steps.extend(
+            [
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=5),
+            ]
+        )
+    steps.append(transforms.ToTensor())
+    return transforms.Compose(steps)
 
 
 def save_decoder_random_pngs(
@@ -459,9 +475,9 @@ def run(
                 f"latent_dim={cfg['latent_dim']}, beta={cfg['beta']:.4f}, use_aug={cfg['use_aug']}"
             )
 
-            train_ds = AnomalyImageDataset(train_o, data_root, get_train_transform(cfg["use_aug"]))
-            val_ds = AnomalyImageDataset(val_o, data_root, get_eval_transform())
-            test_ds = AnomalyImageDataset(test_o, data_root, get_eval_transform()) if not test_o.empty else None
+            train_ds = AnomalyImageDataset(train_o, data_root, get_vae_train_transform(cfg["use_aug"]))
+            val_ds = AnomalyImageDataset(val_o, data_root, get_vae_eval_transform())
+            test_ds = AnomalyImageDataset(test_o, data_root, get_vae_eval_transform()) if not test_o.empty else None
             train_loader = DataLoader(
                 train_ds,
                 batch_size=bs_train,
