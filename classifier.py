@@ -13,7 +13,9 @@ from typing import Any
 # preprocessing as anomalydetect.py ensures fair comparison later when augmenting train.
 
 # Data: data/processed/classifier/split_assignments.csv (train/val/test rows) produced by
-# anomalydetect.py; image paths resolve under data/raw (see choose_data_root).
+# anomalydetect.py; image paths resolve under data/raw (see choose_data_root). Augmented CSV
+# from anomalydetect --build-augmented-classifier adds synthetic train rows whose paths live
+# under data/generated/... (resolved by resolve_classifier_image_path).
 
 # Training: Random hyperparameter search (N_TRIALS x EPOCHS per trial). Each trial saves
 # best weights by lowest validation BCE loss under artifacts/classifier/. Test metrics
@@ -41,6 +43,7 @@ from anomalydetect import IMAGE_SIZE, get_eval_transform, get_train_transform
 
 CLASSIFIER_SPLIT_CSV = Path("data/processed/classifier/split_assignments.csv")
 RAW_ROOT = Path("data/raw")
+DATA_ROOT = Path("data")
 CHECKPOINT_DIR = Path("artifacts/classifier")
 
 # Controls repeatability of weight init and the random-search sampler.
@@ -105,7 +108,7 @@ class ClassifierImageDataset(Dataset):
         row = self.frame.iloc[idx]
         # CSV paths are posix-style relative to RAW root; normalize Windows slashes if present.
         rel = str(row["image"]).replace("\\", "/").lstrip("/")
-        path = self.data_root / rel
+        path = resolve_classifier_image_path(rel, self.data_root)
         img = Image.open(path).convert("RGB")
         x = self.transform(img)
         # BCEWithLogitsLoss expects float targets 0.0 (normal) or 1.0 (anomaly).
@@ -147,6 +150,14 @@ def choose_data_root() -> Path:
         if p.is_dir():
             return p
     raise FileNotFoundError("Could not locate data root under data/raw")
+
+
+def resolve_classifier_image_path(rel: str, raw_root: Path) -> Path:
+    """VisA-relative paths resolve under raw_root; VAE synth paths use CSV prefix generated/… under data/."""
+    rel_clean = str(rel).replace("\\", "/").lstrip("/")
+    if rel_clean.startswith("generated/"):
+        return (DATA_ROOT / rel_clean).resolve()
+    return (raw_root / rel_clean).resolve()
 
 
 # Train + validate each epoch. Checkpoint criterion: lowest validation loss (BCE).
@@ -297,7 +308,11 @@ def test(model: nn.Module, test_loader: DataLoader, device: torch.device) -> dic
     }
 
 
-def run(start_trial: int = 0, end_trial_exclusive: int | None = None) -> None:
+def run(
+    start_trial: int = 0,
+    end_trial_exclusive: int | None = None,
+    split_assignments: Path | None = None,
+) -> None:
     # End-to-end: load splits -> for each sampled hyperparam set, train with early-like
     # selection via best val loss checkpoint -> evaluate best weights on test -> track which
     # trial minimized validation loss across the whole search.
@@ -308,10 +323,11 @@ def run(start_trial: int = 0, end_trial_exclusive: int | None = None) -> None:
             f"got start_trial={start_trial}, end_trial_exclusive={global_end}"
         )
 
-    if not CLASSIFIER_SPLIT_CSV.is_file():
-        raise FileNotFoundError(f"Missing classifier split CSV: {CLASSIFIER_SPLIT_CSV}")
+    split_csv = split_assignments if split_assignments is not None else CLASSIFIER_SPLIT_CSV
+    if not split_csv.is_file():
+        raise FileNotFoundError(f"Missing classifier split CSV: {split_csv}")
 
-    frame = pd.read_csv(CLASSIFIER_SPLIT_CSV)
+    frame = pd.read_csv(split_csv)
     train_df = frame[frame["split"] == "train"].copy()
     val_df = frame[frame["split"] == "val"].copy()
     test_df = frame[frame["split"] == "test"].copy()
@@ -342,7 +358,8 @@ def run(start_trial: int = 0, end_trial_exclusive: int | None = None) -> None:
 
     print(
         f"Baseline classifier random search: trials [{start_trial:03d}, {global_end:03d}), "
-        f"full search has N_TRIALS={N_TRIALS}, epochs={EPOCHS}, device={device}"
+        f"full search has N_TRIALS={N_TRIALS}, epochs={EPOCHS}, device={device}\n"
+        f"split CSV: {split_csv}"
     )
 
     for trial_idx in range(start_trial, global_end):
@@ -453,8 +470,19 @@ def main() -> None:
         help=f"Exclusive end trial index (default: {N_TRIALS}). Example: "
         "`--start-trial 7` runs trials 007..009 when N_TRIALS=10.",
     )
+    parser.add_argument(
+        "--split-assignments",
+        type=Path,
+        default=CLASSIFIER_SPLIT_CSV,
+        help="Classifier split CSV (default: baseline). Use data/processed/classifier_augmented/"
+        "split_assignments.csv for VAE-augmented train set.",
+    )
     args = parser.parse_args()
-    run(start_trial=args.start_trial, end_trial_exclusive=args.end_trial_exclusive)
+    run(
+        start_trial=args.start_trial,
+        end_trial_exclusive=args.end_trial_exclusive,
+        split_assignments=args.split_assignments,
+    )
 
 
 if __name__ == "__main__":
