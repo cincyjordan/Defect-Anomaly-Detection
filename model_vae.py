@@ -17,8 +17,8 @@ from __future__ import annotations
 # After all objects finish, random decoder samples from each object's best trial are saved
 # under data/generated/vae_defects/ as <object>_best_sample_*.png (no-post-samples to skip).
 # Optional test split is evaluated once per trial using the best checkpoint weights.
-# Preconditions: preprocessing (resize/normalize/aug) matches anomalydetect.get_*_transform
-# so VAE inputs stay consistent with the rest of the project.
+# VAE uses [0,1] inputs (Resize + ToTensor only; no ImageNet Normalize). Train-time
+# augmentation is defined in get_vae_train_transform; classifier preprocessing stays in anomalydetect.py.
 
 import random
 import zlib
@@ -158,17 +158,21 @@ def denormalized_to_rgb01(batch: torch.Tensor) -> torch.Tensor:
 def get_vae_eval_transform() -> transforms.Compose:
     return transforms.Compose([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
 
-# VAE train preprocessing; optional mild augmentation, no normalization.
+#VAE-only train pipeline: [0,1] via ToTensor; no Normalization, Flips, Rotations, Color Jitter, Resized Crop, Grayscale. Strong augmentation when use_aug=True.
 def get_vae_train_transform(use_augmentation: bool = False) -> transforms.Compose:
-    steps: list = [transforms.Resize(IMAGE_SIZE)]
+    steps: list[transforms.Transform] = []
     if use_augmentation:
         steps.extend(
             [
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=5),
+                transforms.RandomVerticalFlip(p=0.5),
+                transforms.RandomRotation(degrees=30),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+                transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.8, 1.0)),
+                transforms.RandomGrayscale(p=0.05),
             ]
         )
-    steps.append(transforms.ToTensor())
+    steps.extend([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
     return transforms.Compose(steps)
 
 
