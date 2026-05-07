@@ -87,6 +87,7 @@ class AnomalyImageDataset(Dataset):
 
 # Conv VAE: encoder downsamples by 2^4 = 16; decoder upsamples symmetrically. Latent is
 # diagonal Gaussian (mu, logvar); reparameterization enables backprop through sampling.
+# mu is the mean of the Gaussian, logvar is the log of the variance of the Gaussian.
 # Decoder ends in Sigmoid so outputs are bounded (loss is still MSE vs the transformed target x).
 class ConvVAE(nn.Module):
     def __init__(self, latent_dim: int) -> None:
@@ -261,7 +262,8 @@ def save_vae_trial_curves(
 # One epoch = full train pass + full val pass. Objective: reconstruction MSE + beta * KL.
 # beta trades off reconstruction fidelity vs a standard-normal latent prior (beta-VAE style).
 def get_beta(current_epoch: int, total_epochs: int, target_beta: float) -> float:
-    # Fix 3: KL warmup over first 40% epochs, then keep target beta.
+    # KL warmup over first 40% epochs, then keep target beta.
+    # This is a standard practice to prevent the KL term from dominating the reconstruction term early in training.
     warmup_epochs = max(1, int(0.4 * total_epochs))
     if current_epoch <= warmup_epochs:
         return float(target_beta) * (current_epoch / warmup_epochs)
