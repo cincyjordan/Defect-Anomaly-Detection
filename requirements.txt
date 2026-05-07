@@ -1,7 +1,11 @@
 kaggle
+gradio
 Pillow
 pandas
 scikit-learn
 numpy
 matplotlib
-torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# PyTorch CUDA 12.8 wheels. For CPU-only installs, use the CPU index from pytorch.org instead.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
