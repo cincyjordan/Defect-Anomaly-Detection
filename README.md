@@ -19,13 +19,13 @@
 
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/vae_histogram_grid.png' width = '800'>
 
-The **VAE mosaic** hints which objects converge smoothly (steady val recon) versus which linger with higher KL trade-offs—informing where **CutPaste** or more decoder samples warrant budget.
+The **VAE mosaic** hints which objects converge smoothly (steady val recon) versus which linger with higher KL trade-offs, informing where **CutPaste** or more decoder samples warrant budget.
 
 **Latent space exploration:** t‑SNE, interpolations | **`latent_viz.py`**
 
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/latent_viz_grid.png' width = '800'>
 
- **`latent_viz_grid`**: separation/noise suggests how hard linear decision surfaces become in \mu space before the pooling CNN. Histograms sanity-check scale spread without asserting optimality.
+ **`latent_viz_grid`**: separation/noise suggests how hard linear decision surfaces become in mu space before the pooling CNN. Histograms sanity-check scale spread without asserting optimality.
 
 **Gallery GUI:** browse / sample latent defects **`app.py`** (Gradio).
 
