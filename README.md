@@ -21,11 +21,57 @@
 
 The **VAE mosaic** hints which objects converge smoothly (steady val recon) versus which linger with higher KL trade-offs, informing where **CutPaste** or more decoder samples warrant budget.
 
-**Latent space exploration:** t‑SNE, interpolations | **`latent_viz.py`**
+## **Evaluation Metrics:**
+
+### **Classifier test summary (baseline trial)**
+
+### Metrics table
+
+| Metric | Value |
+|---|---:|
+| Accuracy | 0.8937 |
+| Precision | 0.6471 |
+| Recall | 0.0917 |
+| F1 score | 0.1606 |
+| PR-AUC | 0.3575 |
+| ROC-AUC | 0.7804 |
+
+### Confusion matrix
+
+|  | Predicted Normal | Predicted Anomaly |
+|---|---:|---:|
+| **Actual Normal** | 1912 (TN) | 12 (FP) |
+| **Actual Anomaly** | 218 (FN) | 22 (TP) |
+
+**Interpretation:** the model keeps false positives low (12), but misses many true anomalies (218 FN), which explains high overall accuracy yet low recall on the defect class.
+
+## **Classifier with synthetic data summary**
+
+### Metrics table
+
+| Metric | Value |
+|---|---:|
+| Accuracy | 0.8965 |
+| Precision | 0.7857 |
+| Recall | 0.0917 |
+| F1 score | 0.1642 |
+| PR-AUC | 0.3786 |
+| ROC-AUC | 0.7764 |
+
+### Confusion matrix
+
+|  | Predicted Normal | Predicted Anomaly |
+|---|---:|---:|
+| **Actual Normal** | 1918 (TN) | 6 (FP) |
+| **Actual Anomaly** | 218 (FN) | 22 (TP) |
+
+**Interpretation:** synthetic-data training further reduces false positives (12 -> 6) and improves precision/PR-AUC, but recall remains unchanged because true positives stay at 22 while false negatives remain high (218).
+
+## **Latent space exploration:** t‑SNE, interpolations | **`latent_viz.py`**
 
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/latent_viz_grid.png' width = '800'>
 
- **`latent_viz_grid`**: separation/noise suggests how hard linear decision surfaces become in mu space before the pooling CNN. Histograms sanity-check scale spread without asserting optimality.
+**`latent_viz_grid`**: separation/noise suggests how hard linear decision surfaces become in mu space before the pooling CNN. Histograms sanity-check scale spread without asserting optimality.
 
 **Gallery GUI:** browse / sample latent defects **`app.py`** (Gradio).
 
