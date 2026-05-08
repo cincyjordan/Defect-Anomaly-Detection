@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+# Mask-guided CutPaste generator for defect augmentation.
+
+# VAE synthesis can miss sharp local defect textures.
+# CutPaste gives a cheap second synthetic source by transplanting real defect regions
+# (from anomaly + mask pairs) onto real normal backgrounds from the same object class.
+#
+# Design choices:
+# Uses train split only (no val/test leakage into synthetic training data).
+# Copies only pixels inside the anomaly mask bbox, then scales and repositions the patch.
+# Slight Gaussian feathering on the mask softens hard copy-paste seams.
+# Output folder layout matches downstream ingestion:
+# data/generated/cutpaste_defects/<object>/cutpaste_<object>_sample_XXX.png
+
 import argparse
 import random
 from pathlib import Path
@@ -19,14 +32,18 @@ def make_cutpaste_image(
     min_scale: float,
     max_scale: float,
 ) -> Image.Image:
+    # Background is a real normal image (target class), resized to shared IMAGE_SIZE.
     bg = Image.open(bg_path).convert("RGB").resize(IMAGE_SIZE)
     w, h = bg.size
 
+    # Source + mask come from a real anomaly image pair.
     src = Image.open(src_path).convert("RGB").resize(IMAGE_SIZE)
     mask = Image.open(mask_path).convert("L").resize(IMAGE_SIZE, resample=Image.Resampling.NEAREST)
+    # Low threshold keeps thin defect signals that may be faint in binary masks.
     patch_mask = mask.point(lambda v: 255 if v >= 16 else 0, mode="L")
     bbox = patch_mask.getbbox()
     if bbox is None:
+        # No masked anomaly found; return untouched normal background.
         return bg
     patch = src.crop(bbox)
     patch_mask = patch_mask.crop(bbox)
@@ -39,6 +56,7 @@ def make_cutpaste_image(
     patch_mask = patch_mask.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
 
     if new_w >= w or new_h >= h:
+        # Degenerate placement case; keep sample valid by returning background.
         return bg
     dx = rng.randint(0, w - new_w)
     dy = rng.randint(0, h - new_h)
@@ -83,6 +101,7 @@ def main() -> None:
     if not args.split_csv.is_file():
         raise FileNotFoundError(f"Missing split CSV: {args.split_csv}")
 
+    # Support both common VisA layouts: data/raw/visa-anomaly-detection or data/raw.
     raw_root = Path("data/raw/visa-anomaly-detection")
     if not raw_root.is_dir():
         raw_root = Path("data/raw")
@@ -92,6 +111,7 @@ def main() -> None:
     def resolve_path(rel_path: str) -> Path:
         rel = rel_path.replace("\\", "/").lstrip("/")
         if rel.startswith("generated/"):
+            # Keep compatibility if split CSV already contains generated paths.
             return Path("data") / rel
         return raw_root / rel
 
@@ -102,11 +122,13 @@ def main() -> None:
     else:
         target_objects = [str(args.object)]
 
+    # Seeded RNG makes generated sets reproducible for fair baseline/augmented comparisons.
     rng = random.Random(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     total_written = 0
 
     for obj in target_objects:
+        # Train-only selection avoids leaking evaluation data into synthetic generation.
         normals = df[
             (df["split"] == "train")
             & (df["object"].astype(str) == obj)
@@ -149,6 +171,7 @@ def main() -> None:
         out_dir_obj.mkdir(parents=True, exist_ok=True)
 
         for i in range(args.num):
+            # Random pairing increases local diversity while preserving class context.
             bg_path = rng.choice(normal_paths)
             src_path, mask_path = rng.choice(anomaly_pairs)
             out = make_cutpaste_image(
