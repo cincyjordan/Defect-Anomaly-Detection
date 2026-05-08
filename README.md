@@ -4,22 +4,31 @@
 
 ## **Extra Criteria:**
 
-**Metrics tracking:** visually compare loss vs reconstruction runs Epoch curves as **PNG summaries** (`outputs/viz_grids/`): VAE recon/KL/total grids; classifier baseline vs augmented BCE & accuracy panels. Static plots substituted for weights-and-biases dashboards for reproducibility. 
+**Metrics tracking:** visually compare loss vs reconstruction runs Epoch curves as: VAE reconstruction/KL/total grids; classifier baseline vs augmented BCE & accuracy panels. Static plots substituted for weights-and-biases dashboards for reproducibility. 
 
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/classifier_baseline_vs_augmented_loss_grid.png' width = '800'>
 
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/classifier_histogram_grid.png' width = '800'>
 
-**Classifier compare:** often lower train BCE after augmentation versus **messier validation** if synthetic defects do not match test defect appearances; interpret your PNG for alignment of both curves before claiming generalization gains.
+**Classifier compare:** Classifier loss/accuracy (baseline vs. synthetic augmentation)
+The baseline (left) trains steadily but slowly, with train and val tracking closely, low overfitting but modest gains. The augmented version (right) learns faster and reaches higher accuracy (~92-93% train), but there's a widening gap between train and val loss, suggesting the synthetic data helps but introduces some distribution mismatch.
 
 
 **Hyperparameter tuning:** LR, latent size, batch search Random search in `**model_vae.py`** (latent dim, beta, LR, augmentation) and `**classifier.py**` (LR, batch, dropout); best runs selected on val reconstruction / val BCE respectively. Mosaic VAE curves show cross-category variability. 
 
+<img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/vae_outputs_one_sample_per_class.png' width = '800'>
+
+**VAE decoder samples results:**
+The reconstructions are recognizable but blurry, typical of VAEs. Simple-shaped objects (candle, cashew, macaroni) reconstruct more crisply. More complex PCB boards show more blur and loss of fine detail, which makes sense given the higher spatial complexity. Overall the VAE has captured class-level structure successfully.
+
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/vae_best_loss_grid.png' width = '800'>
+
+All classes converge cleanly within ~5-10 epochs. Reconstruction loss and total loss drop sharply then flatten. KL loss is very small across the board. Train and val curves stay close together, indicating no significant overfitting, the VAEs trained well across all 12 classes.
 
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/vae_histogram_grid.png' width = '800'>
 
-The **VAE mosaic** hints which objects converge smoothly (steady val recon) versus which linger with higher KL trade-offs, informing where **CutPaste** or more decoder samples warrant budget.
+**Candle Weights/Biases**
+Parameters are tightly zero-centered with very small sigmoid values throughout, a sign of a well-regularized model. The fc_logvar layers are especially tight, which is expected in a VAE bottleneck. No dead neurons or saturated weights are evident.
 
 ## **Evaluation Metrics:**
 
@@ -71,7 +80,7 @@ The **VAE mosaic** hints which objects converge smoothly (steady val recon) vers
 
 <img src='https://raw.githubusercontent.com/cincyjordan/Defect-Anomaly-Detection/refs/heads/main/outputs/viz_grids/latent_viz_grid.png' width = '800'>
 
-**`latent_viz_grid`**: separation/noise suggests how hard linear decision surfaces become in mu space before the pooling CNN. Histograms sanity-check scale spread without asserting optimality.
+**`latent_viz_grid`**: Most classes show reasonable mixing of train/val/test splits in latent space, meaning the VAE generalizes well. A few classes (pcb2, pcb3, pipe_fryum) show extreme axis scales with outliers far from the main cluster, likely a few anomalous samples or numerical instability in the latent encoding for those categories.
 
 **Gallery GUI:** browse / sample latent defects **`app.py`** (Gradio).
 
