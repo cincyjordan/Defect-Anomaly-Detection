@@ -14,17 +14,23 @@ from typing import Any
 
 # Data: data/processed/classifier/split_assignments.csv (train/val/test rows) produced by
 # anomalydetect.py; image paths resolve under data/raw (see choose_data_root). Augmented CSV
-# from anomalydetect --build-augmented-classifier adds synthetic train rows whose paths live
+# from anomalydetect build-augmented-classifier adds synthetic train rows whose paths live
 # under data/generated/... (resolved by resolve_classifier_image_path).
 
 # Training: Random hyperparameter search (N_TRIALS x EPOCHS per trial). Each trial saves
-# best weights by lowest validation BCE loss under artifacts/classifier/. Test metrics
+# best weights by lowest validation BCE loss under artifacts/classifier/, plus
+# <stem>_loss_curves.png (train/val BCE and accuracy) next to the checkpoint.
+# Test metrics
 # include PR-AUC / ROC-AUC because accuracy alone is misleading under class imbalance.
 
 import argparse
 import random
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -39,7 +45,7 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Dataset
 
 # Shared crop size and transforms with anomalydetect / VAE so all models see comparable pixels.
-from anomalydetect import IMAGE_SIZE, get_eval_transform, get_train_transform
+from anomalydetect import get_eval_transform, get_train_transform
 
 CLASSIFIER_SPLIT_CSV = Path("data/processed/classifier/split_assignments.csv")
 RAW_ROOT = Path("data/raw")
@@ -60,7 +66,7 @@ DROPOUT_CHOICES = [0.1, 0.2, 0.3, 0.4]
 USE_AUG_CHOICES = [False, True]
 
 
-def sample_classifier_trial_cfg(rng: random.Random) -> dict:
+def sample_classifier_trial_cfg(rng: random.Random) -> dict[str, Any]:
     """One random-search draw; must stay in sync across runs for reproducible resumes."""
     return {
         "lr": 10 ** rng.uniform(*LR_LOG10_RANGE),
@@ -68,6 +74,32 @@ def sample_classifier_trial_cfg(rng: random.Random) -> dict:
         "dropout": rng.choice(DROPOUT_CHOICES),
         "use_aug": rng.choice(USE_AUG_CHOICES),
     }
+
+
+def save_classifier_loss_curves_png(
+    history: dict[str, list[float]],
+    out_path: Path,
+    *,
+    title: str,
+) -> None:
+    epochs = history["epoch"]
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    axes[0].plot(epochs, history["train_loss"], label="train", lw=2)
+    axes[0].plot(epochs, history["val_loss"], label="val", lw=2)
+    axes[0].set_ylabel("BCE loss")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    axes[1].plot(epochs, history["train_acc"], label="train acc", lw=2)
+    axes[1].plot(epochs, history["val_acc"], label="val acc", lw=2)
+    axes[1].set_ylabel("accuracy")
+    axes[1].set_xlabel("epoch")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def best_overall_from_saved_trials(checkpoint_dir: Path, start_exclusive: int) -> dict[str, Any]:
@@ -170,10 +202,17 @@ def train(
     device: torch.device,
     epochs: int,
     best_path: Path,
-) -> float:
+) -> tuple[float, dict[str, list[float]]]:
     best_val_loss = float("inf")
     # Numerically stable binary classification loss for logits + float {0,1} targets.
     criterion = nn.BCEWithLogitsLoss()
+    history: dict[str, list[float]] = {
+        "epoch": [],
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+    }
 
     for epoch in range(1, epochs + 1):
         model.train(True)
@@ -229,6 +268,12 @@ def train(
             f"val loss {val_loss:.6f}, acc {val_acc:.4f}"
         )
 
+        history["epoch"].append(float(epoch))
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             # Minimal checkpoint here; run() re-saves with full trial config after training ends.
@@ -241,7 +286,7 @@ def train(
                 best_path,
             )
 
-    return best_val_loss
+    return best_val_loss, history
 
 
 # Held-out evaluation: same BCE as training for a comparable "test loss", plus ranking metrics
@@ -342,6 +387,7 @@ def run(
         torch.cuda.manual_seed_all(SEED)
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
     rng = random.Random(SEED)
     for _ in range(start_trial):
         sample_classifier_trial_cfg(rng)
@@ -400,7 +446,7 @@ def run(
         model = BaselineCNN(dropout=cfg["dropout"]).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
         best_path = CHECKPOINT_DIR / f"baseline_trial_{trial_idx:03d}.pt"
-        best_val_loss = train(
+        best_val_loss, history = train(
             model=model,
             optimizer=optimizer,
             train_loader=train_loader,
@@ -419,6 +465,13 @@ def run(
             "trial_index": trial_idx,
         }
         torch.save(saved, best_path)
+
+        curves_png = best_path.with_name(best_path.stem + "_loss_curves.png")
+        save_classifier_loss_curves_png(
+            history,
+            curves_png,
+            title=f"Classifier trial {trial_idx:03d} — {split_csv.name}",
+        )
 
         # Reload best val checkpoint into a fresh module so test reflects saved weights, not
         # whatever the last training epoch left in memory.
@@ -442,6 +495,7 @@ def run(
             f"{test_stats['fn']} {test_stats['tp']}"
         )
         print(f"checkpoint: {best_path}")
+        print(f"loss curves: {curves_png}")
 
         if best_val_loss < float(best_overall["val_loss"]):
             best_overall = {"val_loss": best_val_loss, "trial": trial_idx, "path": best_path, "config": cfg}
