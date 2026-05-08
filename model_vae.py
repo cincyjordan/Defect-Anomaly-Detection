@@ -11,8 +11,8 @@ from __future__ import annotations
 # data/raw/visa-anomaly-detection - see choose_data_root).
 # Training: each VisA object (category) trains its own VAE only on anomalies for that
 # object - avoids one global manifold averaging unrelated products together.
-# Random search (N_TRIALS) runs per object; checkpoints land under artifacts/vae/<object>/.
-# Per-trial curves: artifacts/vae/plots/<object>/…
+# Random search (N_TRIALS) runs per object; checkpoints under artifacts/vae/<object>/.
+# Per-trial train/val recon–KL–loss curves: artifacts/vae/plots/<object>/vae_trial_XXX.png.
 #
 # After all objects finish, random decoder samples from each object's best trial are saved
 # under data/generated/vae_defects/ as <object>_best_sample_*.png (no-post-samples to skip).
@@ -467,6 +467,7 @@ def run(
         obj_ckpt_root = CHECKPOINT_DIR / obj
         obj_ckpt_root.mkdir(parents=True, exist_ok=True)
         plots_o = plots_dir / obj
+        plots_o.mkdir(parents=True, exist_ok=True)
 
         print(f"\n======== Object: {obj} | train {len(train_o)} | val {len(val_o)} | test {len(test_o)} ==========")
 
